@@ -254,7 +254,14 @@ export interface Run {
   otf?: RunOpenType
   /** hyperlink info; rId references an existing relationship in the original docx.
    *  plain: unstyled run of a bookmark link (Word shows it in the paragraph's ink) */
-  link?: { href: string; rId?: string; tooltip?: string; plain?: boolean }
+  link?: {
+    href: string
+    rId?: string
+    anchor?: string
+    history?: string
+    tooltip?: string
+    plain?: boolean
+  }
   /**
    * ids of comments whose range covers this run. Only set when the whole
    * commentRangeStart..End pair lives inside the same paragraph, so an edited
@@ -992,6 +999,10 @@ export interface SectionInfo {
 
 /** one rich paragraph of a header / footer part */
 export interface HfParagraph extends ParaFormat {
+  /** w:pStyle (a style the document defines): written back on save, so Word keeps
+   *  the paragraph in its Header / Footer style. Its properties are already
+   *  resolved into this format; the reference only names the style. */
+  styleId?: string
   /** w:framePr w:xAlign — text frame floated at the margin edge; the line
    *  overlays the following paragraph's flow line instead of stacking (Word) */
   frameXAlign?: 'left' | 'center' | 'right'

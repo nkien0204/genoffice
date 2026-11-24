@@ -1,6 +1,7 @@
 import { FloatWatch } from './editor/float-watch'
 import { attachCommentUndoSync, resetCommentUndoStore } from './editor/comment-undo-sync'
 import { scriptFontHtml } from './editor/script-fonts'
+import { storyEscLeavesView } from './editor/story-view'
 import { carryDocSeen } from './ai/tools'
 import {
   DOC_CSS_COMMITTED_EVENT,
@@ -83,6 +84,7 @@ import {
   pushDownWebInlineStyles,
 } from './editor/paste-web-html'
 import {
+  armPlainPaste,
   beginForeignPaste,
   caretParaFormat,
   caretStyleMark,
@@ -91,6 +93,7 @@ import {
   lastForeignPasteMode,
   mergeFormattingFragment,
   stashPastePayload,
+  takePlainPaste,
   takeTextReroute,
 } from './editor/paste-options'
 import { PasteOptionsChip } from './components/PasteOptionsChip'
@@ -180,7 +183,7 @@ import {
   renumber,
   type AiNotesAccess,
 } from './ai/note-ops'
-import { applyHfText, hfEditText } from './editor/hf-text'
+import { applyHfText, hfBlankPara, hfEditText } from './editor/hf-text'
 import {
   insertHfField,
   liveHfFieldOf,
@@ -1383,6 +1386,12 @@ export function App() {
     if (v) setViewMode('print')
     setReadMode(v)
   }
+  // Story Focus: dim everything but the sentence the caret sits in (the
+  // story-view bar's toggle; the plugin draws the dim ranges)
+  const [storyFocus, setStoryFocus] = useState(false)
+  // the view Story View returns to when it closes (Leave Story, Esc): the one
+  // the document was in before entering
+  const [storyReturnView, setStoryReturnView] = useState<ViewMode>('print')
   const [showGrid, setShowGrid] = useState(false)
   const [splitView, setSplitView] = useState(false)
   const [showPagePreview, setShowPagePreview] = useState(false)
@@ -1926,8 +1935,14 @@ export function App() {
         if (!data) return false
         const html = data.getData('text/html')
         // text-mode foreign paste (default setting or chip choice): the whole
-        // payload goes down the plain-text lane, formatting like typing
-        if (takeTextReroute()) {
+        // payload goes down the plain-text lane, formatting like typing.
+        // Paste and Match Style (⌥⇧⌘V / Ctrl+Shift+V) joins it: the clipboard's
+        // text goes in literally whatever flavors the event carries, never
+        // through the Markdown lane below (#2856). Both flags are one-shot and
+        // consumed before deciding, so an armed match-style can't leak into a
+        // later plain Cmd+V.
+        const matchStyle = takePlainPaste()
+        if (matchStyle || takeTextReroute()) {
           const plain = data.getData('text/plain') || htmlFallbackText(html)
           if (plain) {
             const slice = pasteTextSlice(plain, view.state.selection.$from, view)
@@ -2713,11 +2728,25 @@ export function App() {
 
   // story view (View ▸ Story View): the plugin draws the margin markers and
   // keeps typed text off the document's hidden formatting, only while the view
-  // mode is story
+  // mode is story; Focus dims everything but the caret's sentence, inside the
+  // view only
   useEffect(() => {
     if (!editor) return
     editor.commands.setStoryViewActive(viewMode === 'story')
-  }, [editor, viewMode])
+    editor.commands.setStoryViewFocus(storyFocus && viewMode === 'story')
+  }, [editor, viewMode, storyFocus])
+
+  // entering Story View records the view it came from, so Leave Story (and Esc)
+  // returns the document to where it was
+  const viewBeforeStoryRef = useRef<ViewMode>('print')
+  useEffect(() => {
+    if (viewMode === 'story') {
+      if (viewBeforeStoryRef.current !== 'story') setStoryReturnView(viewBeforeStoryRef.current)
+      viewBeforeStoryRef.current = 'story'
+    } else {
+      viewBeforeStoryRef.current = viewMode
+    }
+  }, [viewMode])
 
   // Backstop for paths that bypass the view buttons (read-only opens land in read mode)
   useEffect(() => {
@@ -3604,6 +3633,20 @@ export function App() {
   /** the list style Bullets and Numbering opens on: one just added */
   const [addedListStyle, setAddedListStyle] = useState<string | undefined>()
   const [listRecentsEpoch, setListRecentsEpoch] = useState(0)
+
+  // Story View: Esc leaves, back to the view the document came in from. An
+  // Escape meant for something else never claims the view (storyEscLeavesView):
+  // the context menu, the comment popup and the dialogs close on their own
+  // Escape instead, and so does an Escape inside the find panel.
+  useEffect(() => {
+    if (viewMode !== 'story') return
+    const onKey = (e: KeyboardEvent) => {
+      if (!storyEscLeavesView(e, !!(showLinkModal || listDialog || ctxMenu || commentPopup))) return
+      setViewMode(storyReturnView)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [viewMode, showLinkModal, listDialog, ctxMenu, commentPopup, storyReturnView])
   const recentLists = useMemo(
     () => ({
       bullets: recentListPresets('bullets'),
@@ -5209,7 +5252,9 @@ export function App() {
     let secWidthSig = ''
     let charSpaceSig = ''
     const colWidthPass = newWidthPassState()
-    const pmEl = () => document.querySelector('.editor-scroll .ProseMirror') as HTMLElement | null
+    // the body editor: an open first-page header editor is an earlier .ProseMirror
+    const pmEl = () =>
+      document.querySelector('.editor-scroll .ProseMirror.doc-page') as HTMLElement | null
     const locate = () => {
       const pm = pmEl()
       if (!pm || slices.length === 0) return
@@ -6661,7 +6706,12 @@ export function App() {
         // re-anchor them to the paper before the strips are measured/aligned
         alignTableGapFills(pm, factor)
         stage('tableGapFills')
-        if ((secWSpecs.length > 0 || mirrorMargins) && section) {
+        // the stylesheet centers a strip on the paper: it sits on the left margin
+        // only when the side margins are equal
+        const offCenter = (secList?.map((s) => s.settings) ?? [section]).some(
+          (s) => s != null && s.marginLeft !== s.marginRight,
+        )
+        if ((secWSpecs.length > 0 || mirrorMargins || offCenter) && section) {
           const cSet = secList?.[0]?.settings ?? section
           alignGapHfStrips(pm, pageLeftOf(cSet) + twipsToPx(cSet.marginLeft), factor)
         }
@@ -7303,7 +7353,7 @@ export function App() {
   const documentStats = useCallback((): DocStats | null => {
     if (!editor) return null
     const text = documentTextForWordCount(editor.state.doc)
-    const pm = document.querySelector('.ProseMirror')
+    const pm = document.querySelector('.ProseMirror.doc-page')
     const zoomFactor = zoom / 100
     let lines = 0
     if (pm) {
@@ -8258,6 +8308,9 @@ export function App() {
   }
   // native application menu → renderer commands
   useEffect(() => window.desktop.onMenuCommand(runCommand), [runCommand])
+  // the menu's paste-and-match-style arms the plain-paste flag just before its
+  // paste event fires, so the editor skips the Markdown lane (see #2856)
+  useEffect(() => window.desktop.onPastePlain(armPlainPaste), [])
   useEffect(() => {
     setKeyLayerRunner(runCommand)
     return () => setKeyLayerRunner(null)
@@ -8269,7 +8322,7 @@ export function App() {
     (anchor: string, tocTitle = '') => {
       let target: Element | null = null
       if (anchor === TOP_ANCHOR) {
-        document.querySelector('.ProseMirror')?.firstElementChild?.scrollIntoView({
+        document.querySelector('.ProseMirror.doc-page')?.firstElementChild?.scrollIntoView({
           behavior: 'smooth',
           block: 'start',
         })
@@ -8503,6 +8556,7 @@ export function App() {
       pageTotal: el.dataset.hfTotal ?? '1',
       sectionPages: el.dataset.hfSectionPages,
       spellcheck: spellcheckActive,
+      blank: hfBlankPara(kind, fileCtxRef.current.doc?.parsed.styles),
       onCommit: (next) => {
         committed = true
         // the ribbon may have unlinked the section since the editor opened
@@ -8568,15 +8622,12 @@ export function App() {
   openHfEditorRef.current = openHfEditor
   // Word: a double-click anywhere in a page's top or bottom margin opens that
   // page's header or footer, empty or not (the strips cover only their text)
-  const hfMarginHitOf = (e: { target: EventTarget | null; clientX: number; clientY: number }) => {
-    if (readMode || isProtected || viewMode !== 'print') return null
-    if (!(e.target instanceof Element) || e.target.closest(HF_MARGIN_SKIP)) return null
-    if (e.target.closest('.page-hf')) return null
+  /** every page's top and bottom margin on the canvas, from the last pagination pass */
+  const marginBandsNow = () => {
     const layout = pageLayoutRef.current
     const pm = editor?.view.dom
     if (!layout || layout.cuts.length === 0 || !pm) return null
     const r = pm.getBoundingClientRect()
-    if (e.clientX < r.left || e.clientX > r.right) return null
     const zf = zoom / 100
     const secList = layout.flow?.secList
     const bands = pageMarginBands(
@@ -8589,7 +8640,15 @@ export function App() {
         return set ? effectiveBottomPx(set, cut.hf.footerPx) : 0
       },
     )
-    return hfBandAt(bands, (e.clientY - r.top) / zf)
+    return { bands, rect: r, zf }
+  }
+  const hfMarginHitOf = (e: { target: EventTarget | null; clientX: number; clientY: number }) => {
+    if (readMode || isProtected || viewMode !== 'print') return null
+    if (!(e.target instanceof Element) || e.target.closest(HF_MARGIN_SKIP)) return null
+    if (e.target.closest('.page-hf')) return null
+    const now = marginBandsNow()
+    if (!now || e.clientX < now.rect.left || e.clientX > now.rect.right) return null
+    return hfBandAt(now.bands, (e.clientY - now.rect.top) / now.zf)
   }
   const hfMarginHitRef = useRef(hfMarginHitOf)
   hfMarginHitRef.current = hfMarginHitOf
@@ -8724,6 +8783,21 @@ export function App() {
     hfSections.length > 1
       ? t(kind === 'header' ? 'appHfHeaderSectionTag' : 'appHfFooterSectionTag', { n: si + 1 })
       : null
+
+  // Word marks the part being edited by a line across the page where the body
+  // starts (header) or ends (footer), tagged with the part's name
+  const hfBoundary = (() => {
+    if (!hfEditing || viewMode !== 'print') return null
+    const band = marginBandsNow()?.bands[hfEditing.pageIdx]
+    if (!band) return null
+    const { kind, section: si, variant } = hfEditing
+    return {
+      kind,
+      y: kind === 'header' ? band.headerBottom : band.footerTop,
+      label: hfSectionLabel(kind, si) ?? t(kind === 'header' ? 'ribbonHeader' : 'ribbonFooter'),
+      linked: hfLinkedAt(si, kind, variant) === true,
+    }
+  })()
 
   // Word: double-clicking a picture only selects it (the press already did);
   // the image viewer stays on the context menu
@@ -9596,7 +9670,7 @@ export function App() {
   // selection / popup changes only restyle the margin layer: redraw it without a pagination pass
   useEffect(() => {
     if (!editor || !doc) return
-    const pm = document.querySelector('.editor-scroll .ProseMirror') as HTMLElement | null
+    const pm = document.querySelector('.editor-scroll .ProseMirror.doc-page') as HTMLElement | null
     const wrap = pm?.closest('.page-wrap') as HTMLElement | null
     if (!pm || !wrap) return
     syncMarginAnnotations(
@@ -10117,7 +10191,8 @@ export function App() {
     lastPageMargins &&
     (paperW - lastBox.width > 0.5 ||
       Math.abs(lastBox.contentWidth - canvasBox.contentWidth) > 0.5 ||
-      mirrorMargins)
+      mirrorMargins ||
+      lastPageMargins.left !== lastPageMargins.right)
       ? {
           width: `${lastBox.contentWidth}px`,
           left: `${pageLeftOf(lastSection!) + twipsToPx(lastPageMargins.left)}px`,
@@ -10126,12 +10201,15 @@ export function App() {
         }
       : undefined
   // symmetric pin for the leading header (it belongs to the first section): the
-  // widened shared paper would otherwise re-center it at the wrong x
+  // widened shared paper, or side margins that differ, would otherwise center it
+  // at the wrong x
   const edgeHeaderStyle =
     canvasBox &&
     canvasSection &&
     firstPageMargins &&
-    (paperW - canvasBox.width > 0.5 || mirrorMargins)
+    (paperW - canvasBox.width > 0.5 ||
+      mirrorMargins ||
+      firstPageMargins.left !== firstPageMargins.right)
       ? {
           width: `${canvasBox.contentWidth}px`,
           left: `${pageLeftOf(canvasSection) + twipsToPx(firstPageMargins.left)}px`,
@@ -10183,13 +10261,16 @@ export function App() {
     multipage ? 'multipage' : '',
     showMarks ? 'show-marks' : '',
     `view-${viewMode}`,
+    viewMode === 'story' && storyFocus ? 'story-focus-on' : '',
     showGrid ? 'show-grid' : '',
     tableGridlines ? 'show-table-gridlines' : '',
-  ].join(' ')
+  ]
+    .filter(Boolean)
+    .join(' ')
 
   return (
     <div
-      className={`app ${readMode ? 'read-mode' : ''}${focusMode ? ' focus-mode' : ''}${commentsUi.panel ? ' comments-pane-open' : ''}${revisionDisplay !== 'all' ? ` rev-display-${revisionDisplay}` : ''}${balloonsActive && balloonMode === 'revisions' ? ' rev-balloon' : ''}${revisionFilter.insDel ? '' : ' rev-hide-insdel'}${revisionFilter.format ? '' : ' rev-hide-format'}${tcOptions.balloonLines ? '' : ' markup-no-lines'}`}
+      className={`app ${readMode ? 'read-mode' : ''}${viewMode === 'story' ? ' story-chrome' : ''}${focusMode ? ' focus-mode' : ''}${commentsUi.panel ? ' comments-pane-open' : ''}${revisionDisplay !== 'all' ? ` rev-display-${revisionDisplay}` : ''}${balloonsActive && balloonMode === 'revisions' ? ' rev-balloon' : ''}${revisionFilter.insDel ? '' : ' rev-hide-insdel'}${revisionFilter.format ? '' : ' rev-hide-format'}${tcOptions.balloonLines ? '' : ' markup-no-lines'}`}
       data-balloons={balloonsActive ? balloonMode : undefined}
       data-comment-cards={commentsUi.cards ? '' : undefined}
       data-comment-focus={commentFocus?.id}
@@ -10544,6 +10625,7 @@ export function App() {
                           <HeaderFooterArea
                             kind="header"
                             value={shownHeader ?? { text: '' }}
+                            blank={hfBlankPara('header', doc?.parsed.styles)}
                             images={hfImagesOf('header')}
                             readOnly={isProtected || readMode}
                             onCommit={(next) => {
@@ -10553,7 +10635,6 @@ export function App() {
                             pageNo={firstPageNoText}
                             pageTotal={pageInfo.total}
                             sectionPages={edgeSectionPages?.first}
-                            sectionLabel={hfSectionLabel('header', 0)}
                             editRequest={
                               hfAreaEditRequest?.kind === 'header' ? hfAreaEditRequest.nonce : null
                             }
@@ -10585,6 +10666,20 @@ export function App() {
                             }
                           />
                         )}
+                        {hfBoundary && (
+                          <div
+                            className={`hf-boundary hf-boundary-${hfBoundary.kind}`}
+                            style={{ top: `${hfBoundary.y}px` }}
+                            contentEditable={false}
+                          >
+                            <span className="hf-boundary-tag">{hfBoundary.label}</span>
+                            {hfBoundary.linked && (
+                              <span className="hf-boundary-tag hf-boundary-tag-end">
+                                {t('appHfSameAsPrevious')}
+                              </span>
+                            )}
+                          </div>
+                        )}
                         <EditorContent editor={editor} />
                         {/* footnotes already shown per page in page gaps aren't repeated at the end (last page's footnotes still live here) */}
                         <PageFootnotes
@@ -10612,6 +10707,7 @@ export function App() {
                           <HeaderFooterArea
                             kind="footer"
                             value={shownFooter ?? { text: '' }}
+                            blank={hfBlankPara('footer', doc?.parsed.styles)}
                             images={hfImagesOf('footer')}
                             readOnly={isProtected || readMode}
                             onCommit={(next) => {
@@ -10627,8 +10723,6 @@ export function App() {
                             pageNo={lastPageNoText}
                             pageTotal={pageInfo.total}
                             sectionPages={edgeSectionPages?.last}
-                            linked={hfLinkedAt(lastSectionIdx, 'footer', footerAreaView)}
-                            sectionLabel={hfSectionLabel('footer', lastSectionIdx)}
                             editRequest={
                               hfAreaEditRequest?.kind === 'footer' ? hfAreaEditRequest.nonce : null
                             }
@@ -10721,6 +10815,64 @@ export function App() {
               <button className="read-exit" onClick={() => setReadMode(false)}>
                 {t('appExitReadMode')}
               </button>
+            )}
+            {doc && editor && viewMode === 'story' && !readMode && (
+              <div className="story-bar" role="toolbar" aria-label={t('ribbonStoryView')}>
+                <button
+                  type="button"
+                  className="story-bar-btn"
+                  onClick={() => editor.chain().focus().toggleMark('bold').run()}
+                >
+                  {t('ribbonMarkerBold')}
+                </button>
+                <button
+                  type="button"
+                  className="story-bar-btn"
+                  onClick={() => editor.chain().focus().toggleMark('italic').run()}
+                >
+                  {t('ribbonMarkerItalic')}
+                </button>
+                <button
+                  type="button"
+                  className="story-bar-btn"
+                  onClick={() => setShowLinkModal(true)}
+                >
+                  {t('ribbonLink')}
+                </button>
+                <button
+                  type="button"
+                  className="story-bar-btn"
+                  onClick={() => setListDialog('bullet')}
+                >
+                  {t('storyBarList')}
+                </button>
+                <span className="story-bar-gap" />
+                <button
+                  type="button"
+                  className={`story-bar-btn${trackChanges ? ' on' : ''}`}
+                  aria-pressed={trackChanges}
+                  disabled={isProtected || trackChangesForced}
+                  onClick={toggleTrackChangesByUser}
+                >
+                  {t('ribbonTrackChanges')}
+                </button>
+                <button
+                  type="button"
+                  className={`story-bar-btn${storyFocus ? ' on' : ''}`}
+                  aria-pressed={storyFocus}
+                  onClick={() => setStoryFocus((v) => !v)}
+                >
+                  {t('storyBarFocus')}
+                </button>
+                <span className="story-bar-count">{t('appWordCountN', { n: wordCount })}</span>
+                <button
+                  type="button"
+                  className="story-bar-btn"
+                  onClick={() => setViewMode(storyReturnView)}
+                >
+                  {t('storyBarLeave')}
+                </button>
+              </div>
             )}
             {doc && commentsUi.panel && (
               <CommentsPanel

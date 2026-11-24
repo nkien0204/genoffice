@@ -5197,7 +5197,18 @@ function extractRuns(
             ? `#${anchor}`
             : ''
         const first = runs.length
-        walk(childrenOf(node), { href, rId, ...(tooltip ? { tooltip } : {}) }, rev)
+        const history = attrs['w:history']
+        walk(
+          childrenOf(node),
+          {
+            href,
+            rId,
+            ...(rId && anchor !== undefined ? { anchor } : {}),
+            ...(rId && history !== undefined ? { history } : {}),
+            ...(tooltip ? { tooltip } : {}),
+          },
+          rev,
+        )
         // Word paints a bookmark link only through its character style: an
         // unstyled run (TOC entries under \h) keeps the paragraph's ink
         if (!rId && anchor) {
@@ -5216,6 +5227,7 @@ function extractRuns(
         pushRun({ ...(base ?? {}), text: control.glyph, sdtCheckboxXml: control.sdtPrXml }, rev)
       } else if (
         name === 'w:smartTag' ||
+        name === 'w:customXml' ||
         name === 'w:sdt' ||
         name === 'w:sdtContent' ||
         name === 'w:dir' ||
@@ -7823,6 +7835,7 @@ function hfParagraphs(
       ...(frameXAlign ? { frameXAlign } : {}),
       ...(emptySz ? { emptyRunSizeHalfPoints: emptySz } : {}),
       ...(emptyFont ? { emptyRunFont: emptyFont } : {}),
+      ...(styleId && styles?.has(styleId) ? { styleId } : {}),
       runs,
     })
     out.push(...anchoredBoxes)
