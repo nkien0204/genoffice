@@ -197,6 +197,8 @@ import {
   workbookExportPdfRequestSchema,
   printerInfoSchema,
   workbookRangeRequestSchema,
+  workbookFilterRequestSchema,
+  workbookFilterResultSchema,
   workbookRangeResultSchema,
   workbookSaveEditsAbortSchema,
   workbookSaveEditsBeginSchema,
@@ -3112,6 +3114,14 @@ export function registerSheetsIpc(): void {
   // shared with the other editor modules — last (identical) registration wins
   ipcMain.removeHandler('app:get-language')
   ipcMain.handle('app:get-language', () => getUiLang())
+  // number separators follow the OS region like Excel; a headless export is
+  // read by scripts, so it keeps canonical notation on every machine
+  ipcMain.removeHandler('sheets:get-number-locale')
+  ipcMain.handle(
+    'sheets:get-number-locale',
+    () =>
+      process.env.GENOFFICE_NUMBER_LOCALE ?? (isHeadlessMode() ? 'en-US' : app.getSystemLocale()),
+  )
 
   /** returns true once when shell opened this tab for a new blank workbook */
   ipcMain.handle('sheets:consume-new-blank', () => {
@@ -3469,6 +3479,13 @@ export function registerSheetsIpc(): void {
     if (!entry.sessions.has(request.sessionId)) throw new Error('Unknown workbook session.')
     const result = await entry.client.readFormulaCells(request)
     return workbookFormulaCellsResultSchema.parse(result)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.filterWorkbookRows, async (event, input: unknown) => {
+    const entry = sessionFor(event)
+    const request = workbookFilterRequestSchema.parse(input)
+    if (!entry.sessions.has(request.sessionId)) throw new Error('Unknown workbook session.')
+    return workbookFilterResultSchema.parse(await entry.client.filterRows(request))
   })
 
   ipcMain.handle(IPC_CHANNELS.findWorkbookCells, async (event, input: unknown) => {

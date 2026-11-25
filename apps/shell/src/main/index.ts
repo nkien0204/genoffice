@@ -329,6 +329,12 @@ import {
   sameAiPanelPrefs,
   type AiPanelPrefs,
 } from '@genoffice/ui/ai-panel-prefs'
+import {
+  MEASUREMENT_UNIT_CHANNELS,
+  defaultMeasurementUnit,
+  isMeasurementUnit,
+  type MeasurementUnitState,
+} from '@genoffice/ui/measurement'
 import type { TabKind } from '../shared/tabs-api'
 import { TABS_CHANNELS } from '../shared/tabs-api'
 import { showErrorDialog } from './error-dialog'
@@ -412,6 +418,7 @@ import {
   detachedWebContentsFor,
   detachedSetTitleFor,
   detachedWindowForWebContents,
+  detachedTabsOf,
   detachedWindowsOf,
   holdDocking,
   dockBandFor,
@@ -3877,7 +3884,7 @@ let tabManager: TabManager | null = null
  * created, and the tab's first save moves the fresh file there.
  * key: 'doc' | 'sheet' | 'slide' | 'markdown' | 'html' | 'pdf'
  */
-/** folders the user excluded from recents, search and session restore (#2844) */
+/** folders the user excluded from recents, search and session restore (genoffice#2844) */
 function excludedFolderPaths(): string[] {
   return readExcludedFolders(readAppSettings(APP_SETTINGS_PATH()))
 }
@@ -4460,14 +4467,35 @@ function createShellWindow(): void {
     openAiDocTab: (content) =>
       ensureTabManager().openDocsTab(undefined, { newBlank: true, aiContent: content }),
     openResultDocTab: (doc) => ensureTabManager().openDocsTab(undefined, { resultDoc: doc }),
-    listTabs: () =>
-      (tabManager?.list() ?? [])
-        .filter((t) => t.kind === 'docs')
-        .map((t) => ({ id: t.id, title: t.title, focused: t.active })),
-    focusTab: (id) => tabManager?.activateTab(id),
+    // the strip's documents, then the windows dragged out of it; a focused
+    // window of its own is where switching starts, not the strip's active tab
+    listTabs: () => {
+      const windows = detachedTabsOf('docs')
+      const away = windows.some((w) => w.focused)
+      return [
+        ...(tabManager?.list() ?? [])
+          .filter((t) => t.kind === 'docs')
+          .map((t) => ({ id: t.id, title: t.title, focused: t.active && !away })),
+        ...windows,
+      ]
+    },
+    focusTab: (id) => {
+      if (activateDetached(id)) return
+      tabManager?.activateTab(id)
+      if (shellWindow && !shellWindow.isDestroyed()) {
+        if (shellWindow.isMinimized()) shellWindow.restore()
+        shellWindow.focus()
+      }
+    },
     arrangeAll: arrangeDocsWindows,
     gatherWindows: gatherDocsWindows,
     detachedWindowCount: () => detachedWindowsOf('docs').length,
+    docsWindows: () => [
+      ...(shellWindow && tabManager?.list().some((t) => t.active && t.kind === 'docs')
+        ? [shellWindow]
+        : []),
+      ...detachedWindowsOf('docs'),
+    ],
     // ⌘W in a detached docs window closes that window (its own close guard runs)
     closeActiveTab: () => {
       const focused = BrowserWindow.getFocusedWindow()
@@ -5156,6 +5184,13 @@ function registerHomeIpc(): void {
     return readKnowledgeFilePage(path, offset)
   })
 
+  // an @ mention attaches a corpus file: the attachment reads need it in the ledger
+  ipcMain.handle('kb:grant-mention', (event, path: unknown): boolean => {
+    if (typeof path !== 'string' || !readStarredFiles().includes(path)) return false
+    sharedPathGrants().grant(event.sender.id, [path])
+    return true
+  })
+
   ipcMain.handle('kb:create-document', async (_event, raw: unknown): Promise<unknown> => {
     const req = parseKbCreateRequest(raw)
     return createKnowledgeDocument(
@@ -5456,7 +5491,10 @@ function registerHomeIpc(): void {
     buildHomeMenu()
     installDockMenu()
     installBackToHomeItems()
-    for (const wc of webContents.getAllWebContents()) wc.send('app:language-changed', lang)
+    for (const wc of webContents.getAllWebContents()) {
+      wc.send('app:language-changed', lang)
+      wc.send(MEASUREMENT_UNIT_CHANNELS.changed, measurementUnitState())
+    }
   })
 
   ipcMain.handle(HOME_CHANNELS.getUpdateChannel, (): UpdateChannel => currentUpdateChannel())
@@ -5515,6 +5553,25 @@ function registerHomeIpc(): void {
   ipcMain.handle(HOME_CHANNELS.getDocumentTheme, (): DocTheme => currentDocTheme())
   // editor tabs ask via the app-wide channel (symmetric with app:get-theme)
   ipcMain.handle('app:get-document-theme', (): DocTheme => currentDocTheme())
+
+  // measurement units (Settings ▸ General): one preference for every editor's
+  // rulers and length fields; unset follows the UI language as it did before
+  // the setting existed (inches for English, centimeters elsewhere)
+  const measurementUnitState = (): MeasurementUnitState => {
+    const saved = readAppSettings(APP_SETTINGS_PATH()).measurementUnit
+    if (isMeasurementUnit(saved)) return { unit: saved, explicit: true }
+    return { unit: defaultMeasurementUnit(currentLang()), explicit: false }
+  }
+  ipcMain.handle(MEASUREMENT_UNIT_CHANNELS.get, (): MeasurementUnitState => measurementUnitState())
+  ipcMain.handle(MEASUREMENT_UNIT_CHANNELS.set, (_event, unit: unknown): MeasurementUnitState => {
+    if (unit !== null && !isMeasurementUnit(unit)) return measurementUnitState()
+    writeAppSetting(APP_SETTINGS_PATH(), 'measurementUnit', unit)
+    const state = measurementUnitState()
+    for (const wc of webContents.getAllWebContents()) {
+      if (!wc.isDestroyed()) wc.send(MEASUREMENT_UNIT_CHANNELS.changed, state)
+    }
+    return state
+  })
 
   ipcMain.handle(HOME_CHANNELS.setDocumentTheme, (_event, theme: unknown) => {
     if (theme !== 'light' && theme !== 'dark' && theme !== 'follow') return
@@ -5615,10 +5672,11 @@ function registerHomeIpc(): void {
         ? { [EXCLUDED_FOLDERS_KEY]: next }
         : { [EXCLUDED_FOLDERS_KEY]: undefined }),
     })
-    // the surfaces re-read the list on their next pass; the watchers and the
-    // search index re-decide now
+    // the surfaces re-read the list on their next pass; the watchers, the
+    // search index and File > Open Recent re-decide now
     ensureFolderWatchers()
     fileIndexer?.refresh()
+    buildDocsMenu()
     return next
   })
   ipcMain.handle(HOME_CHANNELS.pickExcludedFolder, async (event) => {
@@ -7231,7 +7289,10 @@ function installBackToHomeItems(): void {
     accelerator: 'Shift+CmdOrCtrl+H',
     click: () => tabManager?.openHomeTab(),
   }
-  setDocsExtraFileMenuItems([backToHomeItem])
+  // in Docs on the Mac ⇧⌘H is Replace, as in Word
+  const inDocs =
+    process.platform === 'darwin' ? { ...backToHomeItem, accelerator: undefined } : backToHomeItem
+  setDocsExtraFileMenuItems([inDocs])
   setSheetsExtraFileMenuItems([backToHomeItem])
   setSlidesExtraFileMenuItems([backToHomeItem])
 }
